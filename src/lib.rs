@@ -141,6 +141,7 @@ extern crate chrono;
 extern crate lz4;
 extern crate num_bigint;
 extern crate zstd;
+extern crate arrow;
 
 #[cfg(test)]
 extern crate rand;
@@ -163,3 +164,4 @@ pub mod column;
 pub mod record;
 pub mod schema;
 pub mod file;
+pub mod reader;
