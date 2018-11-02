@@ -1,12 +1,9 @@
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::borrow::Borrow;
 
 use schema::types::SchemaDescPtr;
-use schema::types::ColumnDescPtr;
 use schema::types::Type;
 use schema::types::TypePtr;
-use schema::types::BasicTypeInfo;
 use basic::LogicalType;
 use basic::Type as PhysicalType;
 use basic::Repetition;
@@ -17,16 +14,6 @@ use arrow::datatypes::DataType;
 
 use errors::ParquetError;
 use errors::Result;
-
-//impl BasicTypeInfo {
-//  fn is_repeated(&self) -> bool {
-//    self.has_repetition() && (self.repetition()==Repetition::REPEATED)
-//  }
-//
-//  fn is_nullable(&self) -> bool {
-//    !self.has_repetition() || (self.repetition()==Repetition::OPTIONAL)
-//  }
-//}
 
 struct ParquetTypeConverter {
   schema: TypePtr,
@@ -112,7 +99,7 @@ impl ParquetTypeConverter {
     } else {
       match self.schema.get_basic_info().logical_type() {
         LogicalType::LIST => self.to_list(),
-        other => self.to_struct()
+        _ => self.to_struct()
       }
     }
   }
@@ -153,10 +140,10 @@ impl ParquetTypeConverter {
   ///
   
   fn to_struct(&self) -> Result<Option<DataType>> {
-    match self.schema.borrow() {
+    match &*self.schema {
       Type::PrimitiveType {..} => panic!("This should not happen."),
       Type::GroupType {
-        basic_info,
+        basic_info: _,
         fields
       } => {
         fields.iter()
@@ -177,10 +164,10 @@ impl ParquetTypeConverter {
   }
   
   fn to_list(&self) -> Result<Option<DataType>> {
-    match self.schema.borrow() {
+    match &*self.schema {
       Type::PrimitiveType {..} => panic!("This should not happen."),
       Type::GroupType {
-        basic_info,
+        basic_info: _,
         fields
       } if fields.len() == 1 => {
         let list_item = fields.first().unwrap();
@@ -197,13 +184,13 @@ impl ParquetTypeConverter {
             }
           },
           Type::GroupType {
-            basic_info,
+            basic_info: _,
             fields
           } if fields.len()>1 => {
             item_converter.to_data_type()
           },
           Type::GroupType {
-            basic_info,
+            basic_info: _,
             fields
           } if fields.len()==1 && list_item.name()!="array" &&
             list_item.name()!=format!("{}_tuple", self.schema.name()) => {
@@ -213,8 +200,8 @@ impl ParquetTypeConverter {
             nested_item_converter.to_data_type()
           },
           Type::GroupType {
-            basic_info,
-            fields
+            basic_info: _,
+            fields: _
           } => {
             item_converter.to_data_type()
           }
@@ -236,14 +223,14 @@ pub fn parquet_to_arrow_schema_by_columns<T>(
   parquet_schema: SchemaDescPtr, column_indices: T)
   -> Result<Schema>
   where T: IntoIterator<Item=usize> {
-  let leaves = column_indices
+  let leaves = Rc::new(column_indices
     .into_iter()
     .map(|c| parquet_schema.column(c).self_type() as *const Type)
-    .collect::<HashSet<*const Type>>();
+    .collect::<HashSet<*const Type>>());
   
   parquet_schema.root_schema().get_fields()
     .iter()
-    .map(|t| ParquetTypeConverter::new(t.clone(), Rc::new(leaves)))
+    .map(|t| ParquetTypeConverter::new(t.clone(), leaves.clone()).to_field())
     .collect::<Result<Vec<Option<Field>>>>()
     .map(|result| result.into_iter()
       .filter_map(|f| f)
@@ -251,136 +238,6 @@ pub fn parquet_to_arrow_schema_by_columns<T>(
     .map(|fields| Schema::new(fields))
 }
 
-//fn parquet_to_arrow_field(schema: TypePtr, leaves: &HashSet<*const Type>) -> Result<Option<Field>> {
-//  match &*schema {
-//    Type::PrimitiveType {..} => parquet_to_arrow_primitive_field(&*schema, &leaves),
-//    Type::GroupType {..} => parquet_to_arrow_struct_type(&*schema, &leaves)
-//  }
-//}
-//
-//fn parquet_to_arrow_primitive_field(schema: &Type, leaves: &HashSet<*const Type>)
-//  -> Result<Option<Field>> {
-//  match schema {
-//    Type::PrimitiveType {
-//      basic_info,
-//      physical_type,
-//      ..
-//    } => {
-//      let raw_ptr = schema as *const Type;
-//      if leaves.contains(&raw_ptr) {
-//        let data_type = match physical_type {
-//          PhysicalType::BOOLEAN => Ok(DataType::Boolean),
-//          PhysicalType::INT32 => parquet_to_arrow_int32(&basic_info),
-//          PhysicalType::INT64 => parquet_to_arrow_int64(&basic_info),
-//          PhysicalType::FLOAT => Ok(DataType::Float32),
-//          PhysicalType::DOUBLE => Ok(DataType::Float64),
-//          PhysicalType::BYTE_ARRAY => parquet_to_arrow_byte_array(&basic_info),
-//          other => Err(ArrowError::TypeError(format!("Unable to convert parquet type {}", other)))
-//        };
-//
-//        data_type.map(|dt| {
-//          match basic_info.repetition() {
-//            Repetition::REQUIRED => Field::new(basic_info.name(), dt, false),
-//            Repetition::OPTIONAL => Field::new(basic_info.name(), dt, true),
-//            Repetition::REPEATED => Field::new(basic_info.name(),
-//                                               DataType::List(Box::new(dt)), true)
-//          }
-//        }).map(|f| Some(f))
-//      } else {
-//        Ok(None)
-//      }
-//    },
-//    Type::GroupType {..} => panic!("This should not happen.")
-//  }
-//}
-//
-//fn parquet_to_arrow_nested_field(schema: &Type, leaves: &HashSet<*const Type>)
-//  -> Result<Option<Field>> {
-//
-//  match schema {
-//    Type::PrimitiveType {..} => panic!("This should not happen."),
-//    Type::GroupType {
-//      basic_info,
-//      fields
-//    } => {
-//      if basic_info.is_repeated() {
-//        parquet_to_arrow_struct_type(&schema, &leaves)
-//          .map(|opt| opt.map(|dt| {
-//            Field::new(basic_info.name(), DataType::List(Box::new(dt)), true)
-//          }))
-//      } else {
-//        let nullable = basic_info.is_nullable();
-//
-//        let data_type = match basic_info.logical_type() {
-//          LogicalType::LIST => parquet_to_arrow_list_type(&schema, &leaves),
-//          other => parquet_to_arrow_struct_type(&schema, &leaves)
-//        };
-//
-//        data_type.map(|opt| opt.map(|dt| {
-//          Field::new(basic_info.name(), dt, nullable)
-//        }))
-//      }
-//    }
-//  }
-//}
-//
-//fn parquet_to_arrow_list_type(schema: &Type, leaves: &HashSet<*const Type>)
-//  -> Result<Option<DataType>> {
-//  unimplemented!()
-//}
-//
-//fn parquet_to_arrow_struct_type(schema: &Type, leaves: &HashSet<*const Type>)
-//                                -> Result<Option<DataType>> {
-//  match schema {
-//    Type::PrimitiveType {..} => panic!("This should not happen."),
-//    Type::GroupType {
-//      basic_info,
-//      fields
-//    } => {
-//      let struct_fields = fields.iter()
-//        .map(|field_ptr| parquet_to_arrow_field(field_ptr.clone(), leaves))
-//        .collect::<Result<Vec<Option<Field>>>>()?
-//        .into_iter()
-//        .filter_map(|f| f)
-//        .collect::<Vec<Field>>();
-//
-//      if struct_fields.is_empty() {
-//        Ok(None)
-//      } else {
-//        Ok(Some(DataType::Struct(struct_fields)))
-//      }
-//    }
-//  }
-//}
-//
-//fn parquet_to_arrow_int32(t: &BasicTypeInfo) -> Result<DataType> {
-//  match t.logical_type() {
-//    LogicalType::NONE => Ok(DataType::Int32),
-//    LogicalType::UINT_8 => Ok(DataType::UInt8),
-//    LogicalType::UINT_16 => Ok(DataType::UInt16),
-//    LogicalType::UINT_32 => Ok(DataType::UInt32),
-//    LogicalType::INT_8 => Ok(DataType::Int8),
-//    LogicalType::INT_16 => Ok(DataType::Int16),
-//    LogicalType::INT_32 => Ok(DataType::Int32),
-//    other => Err(ArrowError::TypeError(format!("Unable to convert parquet logical type {}", other)))
-//  }
-//}
-//
-//fn parquet_to_arrow_int64(t: &BasicTypeInfo) -> Result<DataType> {
-//  match t.logical_type() {
-//    LogicalType::NONE => Ok(DataType::Int64),
-//    LogicalType::INT_64 => Ok(DataType::Int64),
-//    LogicalType::UINT_64 => Ok(DataType::UInt64),
-//    other => Err(ArrowError::TypeError(format!("Unable to convert parquet logical type {}", other)))
-//  }
-//}
-//
-//fn parquet_to_arrow_byte_array(t: &BasicTypeInfo) -> Result<DataType> {
-//  match t.logical_type() {
-//    LogicalType::UTF8 => Ok(DataType::Utf8),
-//    other => Err(ArrowError::TypeError(format!("Unable to convert parquet logical type {}", other)))
-//  }
-//}
 
 #[cfg(test)]
 mod tests {
@@ -480,5 +337,128 @@ mod tests {
   
   #[test]
   fn test_parquet_lists() {
+    let arrow_fields = vec![
+      Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), false)
+    ];
+    
+    let mut parquet_types = Vec::new();
+  
+    // LIST encoding example taken from parquet-format/LogicalTypes.md
+  
+    // // List<String> (list non-null, elements nullable)
+    // required group my_list (LIST) {
+    //   repeated group list {
+    //     optional binary element (UTF8);
+    //   }
+    // }
+    {
+      let element = PrimitiveTypeBuilder::new("string", PhysicalType::BYTE_ARRAY)
+        .with_logical_type(LogicalType::UTF8)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+      
+      let list = GroupTypeBuilder::new("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+      
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(list)])
+        .build()
+        .unwrap();
+      
+      parquet_types.push(Rc::new(my_list));
+    }
+  
+    // // List<String> (list nullable, elements non-null)
+    // optional group my_list (LIST) {
+    //   repeated group list {
+    //     required binary element (UTF8);
+    //   }
+    // }
+    {
+      let element = PrimitiveTypeBuilder::new("string", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(LogicalType::UTF8)
+        .build()
+        .unwrap();
+      
+      let list = GroupTypeBuilder::new("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+  
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(list)])
+        .build()
+        .unwrap();
+  
+      parquet_types.push(Rc::new(my_list));
+    }
+  
+    // Element types can be nested structures. For example, a list of lists:
+    //
+    // // List<List<Integer>>
+    // optional group array_of_arrays (LIST) {
+    //   repeated group list {
+    //     required group element (LIST) {
+    //       repeated group list {
+    //         required int32 element;
+    //       }
+    //     }
+    //   }
+    // }
+    {
+      let inner_element = PrimitiveTypeBuilder::new("element", PhysicalType::INT32)
+        .with_repetition(Repetition::REQUIRED)
+        .build()
+        .unwrap();
+      
+      let inner_list = GroupTypeBuilder::new("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut vec![Rc::new(inner_element)])
+        .build()
+        .unwrap();
+      
+      let element = GroupTypeBuilder::new("element")
+        .with_logical_type(LogicalType::LIST)
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![Rc::new(inner_list)])
+        .build()
+        .unwrap();
+      
+      let list = GroupTypeBuilder::new("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+      
+      let array_of_arrays = GroupTypeBuilder::new("array_of_arrays")
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(lsit)])
+        .build()
+        .unwrap();
+  
+      parquet_types.push(Rc::new(array_of_arrays));
+    }
+  
+  
+    let parquet_group_type = GroupTypeBuilder::new("")
+      .with_fields(&mut parquet_types)
+      .build()
+      .unwrap();
+  
+    let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
+    let converted_arrow_schema = parquet_to_arrow_schema(parquet_schema.clone()).unwrap();
+  
+    assert_eq!(&arrow_fields, converted_arrow_schema.fields());
   }
 }
