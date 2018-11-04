@@ -79,17 +79,27 @@ impl ParquetTypeConverter {
   
   fn to_primitive_type(&self) -> Result<Option<DataType>> {
     if self.is_self_included() {
-      match self.schema.get_physical_type() {
-        PhysicalType::BOOLEAN => Ok(DataType::Boolean),
-        PhysicalType::INT32 => self.to_int32(),
-        PhysicalType::INT64 => self.to_int64(),
-        PhysicalType::FLOAT => Ok(DataType::Float32),
-        PhysicalType::DOUBLE => Ok(DataType::Float64),
-        PhysicalType::BYTE_ARRAY => self.to_byte_array(),
-        other => Err(ParquetError::ArrowError(format!("Unable to convert parquet type {}", other)))
-      }.map(|dt| Some(dt))
+      self.to_primitive_type_inner().map(|dt| {
+        if self.is_repeated() {
+          Some(DataType::List(Box::new(dt)))
+        } else {
+          Some(dt)
+        }
+      })
     } else {
       Ok(None)
+    }
+  }
+
+  fn to_primitive_type_inner(&self) -> Result<DataType> {
+    match self.schema.get_physical_type() {
+      PhysicalType::BOOLEAN => Ok(DataType::Boolean),
+      PhysicalType::INT32 => self.to_int32(),
+      PhysicalType::INT64 => self.to_int64(),
+      PhysicalType::FLOAT => Ok(DataType::Float32),
+      PhysicalType::DOUBLE => Ok(DataType::Float64),
+      PhysicalType::BYTE_ARRAY => self.to_byte_array(),
+      other => Err(ParquetError::ArrowError(format!("Unable to convert parquet type {}", other)))
     }
   }
   
@@ -178,7 +188,7 @@ impl ParquetTypeConverter {
             ..
           }  => {
             if item_converter.is_repeated() {
-              item_converter.to_data_type()
+              item_converter.to_primitive_type_inner().map(|dt| Some(dt))
             } else {
               Err(ParquetError::ArrowError("Unrecognized list type.".to_string()))
             }
@@ -187,7 +197,7 @@ impl ParquetTypeConverter {
             basic_info: _,
             fields
           } if fields.len()>1 => {
-            item_converter.to_data_type()
+            item_converter.to_struct()
           },
           Type::GroupType {
             basic_info: _,
@@ -203,7 +213,7 @@ impl ParquetTypeConverter {
             basic_info: _,
             fields: _
           } => {
-            item_converter.to_data_type()
+            item_converter.to_struct()
           }
         };
         
@@ -220,17 +230,27 @@ pub fn parquet_to_arrow_schema(parquet_schema: SchemaDescPtr) -> Result<Schema> 
 }
 
 pub fn parquet_to_arrow_schema_by_columns<T>(
-  parquet_schema: SchemaDescPtr, column_indices: T)
-  -> Result<Schema>
+  parquet_schema: SchemaDescPtr, column_indices: T) -> Result<Schema>
   where T: IntoIterator<Item=usize> {
-  let leaves = Rc::new(column_indices
-    .into_iter()
-    .map(|c| parquet_schema.column(c).self_type() as *const Type)
-    .collect::<HashSet<*const Type>>());
-  
-  parquet_schema.root_schema().get_fields()
-    .iter()
-    .map(|t| ParquetTypeConverter::new(t.clone(), leaves.clone()).to_field())
+  let mut base_nodes = Vec::new();
+  let mut base_nodes_set = HashSet::new();
+  let mut leaves = HashSet::new();
+
+  for c in column_indices {
+    let column = parquet_schema.column(c).self_type() as *const Type;
+    let root = parquet_schema.get_column_root_ptr(c);
+    let root_raw_ptr = Rc::into_raw(root.clone());
+
+    leaves.insert(column);
+    if !base_nodes_set.contains(&root_raw_ptr) {
+      base_nodes.push(root);
+      base_nodes_set.insert(root_raw_ptr);
+    }
+  }
+
+  let leaves = Rc::new(leaves);
+  base_nodes.into_iter()
+    .map(|t| ParquetTypeConverter::new(t, leaves.clone()).to_field())
     .collect::<Result<Vec<Option<Field>>>>()
     .map(|result| result.into_iter()
       .filter_map(|f| f)
@@ -252,8 +272,7 @@ mod tests {
   
   use arrow::datatypes::Field;
   use arrow::datatypes::DataType;
-  use arrow::datatypes::Schema;
-  
+
   use super::parquet_to_arrow_schema;
   use super::parquet_to_arrow_schema_by_columns;
   
@@ -337,9 +356,7 @@ mod tests {
   
   #[test]
   fn test_parquet_lists() {
-    let arrow_fields = vec![
-      Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), false)
-    ];
+    let mut arrow_fields = Vec::new();
     
     let mut parquet_types = Vec::new();
   
@@ -372,6 +389,8 @@ mod tests {
         .unwrap();
       
       parquet_types.push(Rc::new(my_list));
+
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), false));
     }
   
     // // List<String> (list nullable, elements non-null)
@@ -394,13 +413,15 @@ mod tests {
         .unwrap();
   
       let my_list = GroupTypeBuilder::new("my_list")
-        .with_repetition(Repetition::REQUIRED)
+        .with_repetition(Repetition::OPTIONAL)
         .with_logical_type(LogicalType::LIST)
         .with_fields(&mut vec![Rc::new(list)])
         .build()
         .unwrap();
   
       parquet_types.push(Rc::new(my_list));
+
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
     }
   
     // Element types can be nested structures. For example, a list of lists:
@@ -443,11 +464,179 @@ mod tests {
       let array_of_arrays = GroupTypeBuilder::new("array_of_arrays")
         .with_repetition(Repetition::OPTIONAL)
         .with_logical_type(LogicalType::LIST)
-        .with_fields(&mut vec![Rc::new(lsit)])
+        .with_fields(&mut vec![Rc::new(list)])
         .build()
         .unwrap();
   
       parquet_types.push(Rc::new(array_of_arrays));
+
+      let arrow_inner_list = DataType::List(Box::new(DataType::Int32));
+      arrow_fields.push(Field::new("array_of_arrays", DataType::List(Box::new(arrow_inner_list)), true));
+    }
+
+
+    // // List<String> (list nullable, elements non-null)
+    // optional group my_list (LIST) {
+    //   repeated group element {
+    //     required binary str (UTF8);
+    //   };
+    // }
+    {
+      let str_ = PrimitiveTypeBuilder::new("str", PhysicalType::BYTE_ARRAY)
+        .with_logical_type(LogicalType::UTF8)
+        .with_repetition(Repetition::REQUIRED)
+        .build()
+        .unwrap();
+
+      let element = GroupTypeBuilder::new("element")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut vec![Rc::new(str_)])
+        .build()
+        .unwrap();
+
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(my_list));
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
+    }
+
+    // // List<Integer> (nullable list, non-null elements)
+    // optional group my_list (LIST) {
+    //   repeated int32 element;
+    // }
+    {
+      let element = PrimitiveTypeBuilder::new("element", PhysicalType::INT32)
+        .with_repetition(Repetition::REPEATED)
+        .build()
+        .unwrap();
+
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_logical_type(LogicalType::LIST)
+        .with_repetition(Repetition::OPTIONAL)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(my_list));
+
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Int32)), true));
+    }
+
+    // // List<Tuple<String, Integer>> (nullable list, non-null elements)
+    // optional group my_list (LIST) {
+    //   repeated group element {
+    //     required binary str (UTF8);
+    //     required int32 num;
+    //   };
+    // }
+    {
+      let mut primitives = vec![
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
+         with_repetition: Repetition::REQUIRED),
+        make_parquet_type!("num", PhysicalType::INT32, with_repetition: Repetition::REQUIRED)
+      ];
+
+      let element = GroupTypeBuilder::new("element")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut primitives)
+        .build()
+        .unwrap();
+
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(element)])
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(my_list));
+
+      let arrow_struct = DataType::Struct(vec![
+        Field::new("str", DataType::Utf8, false),
+        Field::new("num", DataType::Int32, false),
+      ]);
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+    }
+
+    // // List<OneTuple<String>> (nullable list, non-null elements)
+    // optional group my_list (LIST) {
+    //   repeated group array {
+    //     required binary str (UTF8);
+    //   };
+    // }
+    // Special case: group is named array
+    {
+      let mut primitives = vec![
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
+          with_repetition: Repetition::REQUIRED)
+      ];
+
+      let array = GroupTypeBuilder::new("array")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut primitives)
+        .build()
+        .unwrap();
+
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(array)])
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(my_list));
+
+      let arrow_struct = DataType::Struct(vec![
+        Field::new("str", DataType::Utf8, false)
+      ]);
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+    }
+
+    // // List<OneTuple<String>> (nullable list, non-null elements)
+    // optional group my_list (LIST) {
+    //   repeated group my_list_tuple {
+    //     required binary str (UTF8);
+    //   };
+    // }
+    // Special case: group named ends in _tuple
+    {
+      let mut primitives = vec![
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
+          with_repetition: Repetition::REQUIRED)
+      ];
+
+      let array = GroupTypeBuilder::new("my_list_tuple")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(&mut primitives)
+        .build()
+        .unwrap();
+
+      let my_list = GroupTypeBuilder::new("my_list")
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(LogicalType::LIST)
+        .with_fields(&mut vec![Rc::new(array)])
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(my_list));
+
+      let arrow_struct = DataType::Struct(vec![
+        Field::new("str", DataType::Utf8, false)
+      ]);
+      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+    }
+
+    // One-level encoding: Only allows required lists with required cells
+    //   repeated value_type name
+    {
+      parquet_types.push(make_parquet_type!("name", PhysicalType::INT32,
+        with_repetition: Repetition::REPEATED));
+      arrow_fields.push(Field::new("name", DataType::List(Box::new(DataType::Int32)), true));
     }
   
   
@@ -458,7 +647,291 @@ mod tests {
   
     let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
     let converted_arrow_schema = parquet_to_arrow_schema(parquet_schema.clone()).unwrap();
-  
-    assert_eq!(&arrow_fields, converted_arrow_schema.fields());
+    let converted_fields = converted_arrow_schema.fields();
+
+    assert_eq!(arrow_fields.len(), converted_fields.len());
+    for i in 0..arrow_fields.len() {
+      assert_eq!(arrow_fields[i], converted_fields[i]);
+    }
+  }
+
+  #[test]
+  fn test_nested_schema() {
+    let mut arrow_fields = Vec::new();
+    let mut parquet_types = Vec::new();
+
+    // required group group1 {
+    //   required bool leaf1;
+    //   required int32 leaf2;
+    // }
+    // required int64 leaf3;
+    {
+      let group1 = GroupTypeBuilder::new("group1")
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![
+          make_parquet_type!("leaf1", PhysicalType::BOOLEAN, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT32, with_repetition: Repetition::REQUIRED)
+        ]).build()
+        .unwrap();
+      parquet_types.push(Rc::new(group1));
+
+      let leaf3 = make_parquet_type!("leaf3", PhysicalType::INT64,
+        with_repetition: Repetition::REQUIRED);
+      parquet_types.push(leaf3);
+
+
+      let group1_fields = vec![
+        Field::new("leaf1", DataType::Boolean, false),
+        Field::new("leaf2", DataType::Int32, false),
+      ];
+      let group1_struct = Field::new("group1", DataType::Struct(group1_fields), false);
+      arrow_fields.push(group1_struct);
+
+      let leaf3_field = Field::new("leaf3", DataType::Int64, false);
+      arrow_fields.push(leaf3_field);
+    }
+
+    let parquet_group_type = GroupTypeBuilder::new("")
+      .with_fields(&mut parquet_types)
+      .build()
+      .unwrap();
+
+    let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
+    let converted_arrow_schema = parquet_to_arrow_schema(parquet_schema.clone()).unwrap();
+    let converted_fields = converted_arrow_schema.fields();
+
+    assert_eq!(arrow_fields.len(), converted_fields.len());
+    for i in 0..arrow_fields.len() {
+      assert_eq!(arrow_fields[i], converted_fields[i]);
+    }
+  }
+
+  #[test]
+  fn test_nested_schema_partial() {
+    let mut arrow_fields = Vec::new();
+    let mut parquet_types = Vec::new();
+
+    // Full Parquet Schema:
+    // required group group1 {
+    //   required int64 leaf1;
+    //   required int64 leaf2;
+    // }
+    // required group group2 {
+    //   required int64 leaf3;
+    //   required int64 leaf4;
+    // }
+    // required int64 leaf5;
+    //
+    // Expected partial arrow schema (columns 0, 3, 4):
+    // required group group1 {
+    //   required int64 leaf1;
+    // }
+    // required group group2 {
+    //   required int64 leaf4;
+    // }
+    // required int64 leaf5;
+    {
+      let group1 = GroupTypeBuilder::new("group1")
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![
+          make_parquet_type!("leaf1", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+        ]).build()
+        .unwrap();
+      parquet_types.push(Rc::new(group1));
+
+      let group2 = GroupTypeBuilder::new("group2")
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![
+          make_parquet_type!("leaf3", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf4", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+        ]).build()
+        .unwrap();
+      parquet_types.push(Rc::new(group2));
+
+      let leaf5 = make_parquet_type!("leaf5", PhysicalType::INT64,
+        with_repetition: Repetition::REQUIRED);
+      parquet_types.push(leaf5);
+    }
+
+    {
+      let group1_fields = vec![
+        Field::new("leaf1", DataType::Int64, false)
+      ];
+      let group1 = Field::new("group1", DataType::Struct(group1_fields), false);
+      arrow_fields.push(group1);
+
+      let group2_fields = vec![
+        Field::new("leaf4", DataType::Int64, false)
+      ];
+      let group2 = Field::new("group2", DataType::Struct(group2_fields), false);
+      arrow_fields.push(group2);
+
+      arrow_fields.push(Field::new("leaf5", DataType::Int64, false));
+    }
+
+    let parquet_group_type = GroupTypeBuilder::new("")
+      .with_fields(&mut parquet_types)
+      .build()
+      .unwrap();
+
+    let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
+    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(parquet_schema.clone(),
+      vec![0, 3, 4]).unwrap();
+    let converted_fields = converted_arrow_schema.fields();
+
+    assert_eq!(arrow_fields.len(), converted_fields.len());
+    for i in 0..arrow_fields.len() {
+      assert_eq!(arrow_fields[i], converted_fields[i]);
+    }
+  }
+
+  #[test]
+  fn test_nested_schema_partial_ordering() {
+    let mut arrow_fields = Vec::new();
+    let mut parquet_types = Vec::new();
+
+    // Full Parquet Schema:
+    // required group group1 {
+    //   required int64 leaf1;
+    //   required int64 leaf2;
+    // }
+    // required group group2 {
+    //   required int64 leaf3;
+    //   required int64 leaf4;
+    // }
+    // required int64 leaf5;
+    //
+    // Expected partial arrow schema (columns 3, 4, 0):
+    // required group group1 {
+    //   required int64 leaf1;
+    // }
+    // required group group2 {
+    //   required int64 leaf4;
+    // }
+    // required int64 leaf5;
+    {
+      let group1 = GroupTypeBuilder::new("group1")
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![
+          make_parquet_type!("leaf1", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+        ]).build()
+        .unwrap();
+      parquet_types.push(Rc::new(group1));
+
+      let group2 = GroupTypeBuilder::new("group2")
+        .with_repetition(Repetition::REQUIRED)
+        .with_fields(&mut vec![
+          make_parquet_type!("leaf3", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf4", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+        ]).build()
+        .unwrap();
+      parquet_types.push(Rc::new(group2));
+
+      let leaf5 = make_parquet_type!("leaf5", PhysicalType::INT64,
+        with_repetition: Repetition::REQUIRED);
+      parquet_types.push(leaf5);
+    }
+
+    {
+      let group2_fields = vec![
+        Field::new("leaf4", DataType::Int64, false)
+      ];
+      let group2 = Field::new("group2", DataType::Struct(group2_fields), false);
+      arrow_fields.push(group2);
+
+      arrow_fields.push(Field::new("leaf5", DataType::Int64, false));
+
+      let group1_fields = vec![
+        Field::new("leaf1", DataType::Int64, false)
+      ];
+      let group1 = Field::new("group1", DataType::Struct(group1_fields), false);
+      arrow_fields.push(group1);
+    }
+
+    let parquet_group_type = GroupTypeBuilder::new("")
+      .with_fields(&mut parquet_types)
+      .build()
+      .unwrap();
+
+    let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
+    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(parquet_schema.clone(),
+                                                                    vec![3, 4, 0]).unwrap();
+    let converted_fields = converted_arrow_schema.fields();
+
+    assert_eq!(arrow_fields.len(), converted_fields.len());
+    for i in 0..arrow_fields.len() {
+      assert_eq!(arrow_fields[i], converted_fields[i]);
+    }
+  }
+
+  #[test]
+  fn test_repeated_nested_schema() {
+    let mut arrow_fields = Vec::new();
+    let mut parquet_types = Vec::new();
+
+    //   optional int32 leaf1;
+    //   repeated group outerGroup {
+    //     optional int32 leaf2;
+    //     repeated group innerGroup {
+    //       optional int32 leaf3;
+    //     }
+    //   }
+    {
+      parquet_types.push(make_parquet_type!("leaf1", PhysicalType::INT32, with_repetition:
+        Repetition::OPTIONAL));
+
+      let leaf2 = make_parquet_type!("leaf2", PhysicalType::INT32, with_repetition:
+        Repetition::OPTIONAL);
+
+      let leaf3 = make_parquet_type!("leaf3", PhysicalType::INT32, with_repetition:
+        Repetition::OPTIONAL);
+      let inner_group = GroupTypeBuilder::new("innerGroup")
+        .with_fields(&mut vec![leaf3])
+        .with_repetition(Repetition::REPEATED)
+        .build()
+        .unwrap();
+
+      let outer_group = GroupTypeBuilder::new("outerGroup")
+        .with_fields(&mut vec![leaf2, Rc::new(inner_group)])
+        .with_repetition(Repetition::REPEATED)
+        .build()
+        .unwrap();
+
+      parquet_types.push(Rc::new(outer_group));
+    }
+
+    {
+      arrow_fields.push(Field::new("leaf1", DataType::Int32, true));
+
+      let inner_group_list = Field::new("innerGroup",
+        DataType::List(Box::new(DataType::Struct(
+          vec![Field::new("leaf3", DataType::Int32, true)]))),
+        true
+      );
+
+      let outer_group_list = Field::new("outerGroup",
+        DataType::List(Box::new(DataType::Struct(
+          vec![Field::new("leaf2", DataType::Int32, true), inner_group_list]
+        ))),
+        true);
+      arrow_fields.push(outer_group_list);
+    }
+
+    let parquet_group_type = GroupTypeBuilder::new("")
+      .with_fields(&mut parquet_types)
+      .build()
+      .unwrap();
+
+    let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
+    let converted_arrow_schema = parquet_to_arrow_schema(parquet_schema.clone())
+      .unwrap();
+    let converted_fields = converted_arrow_schema.fields();
+
+    assert_eq!(arrow_fields.len(), converted_fields.len());
+    for i in 0..arrow_fields.len() {
+      assert_eq!(arrow_fields[i], converted_fields[i]);
+    }
   }
 }
