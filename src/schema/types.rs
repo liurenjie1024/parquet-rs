@@ -713,6 +713,19 @@ impl SchemaDescriptor {
 
   /// Returns column root [`Type`](`::schema::types::Type`) for a field position.
   pub fn get_column_root(&self, i: usize) -> &Type {
+    let result = self.column_root_of(i);
+    assert!(result.is_some(), "Expected a value for index {} but found None", i);
+    result.unwrap().as_ref()
+  }
+
+  /// Returns column root [`Type`](`::schema::types::Type`) pointer for a field position.
+  pub fn get_column_root_ptr(&self, i: usize) -> TypePtr {
+    let result = self.column_root_of(i);
+    assert!(result.is_some(), "Expected a value for index {} but found None", i);
+    result.unwrap().clone()
+  }
+
+  fn column_root_of(&self, i: usize) -> Option<&Rc<Type>> {
     assert!(
       i < self.leaves.len(),
       "Index out of bound: {} not in [0, {})",

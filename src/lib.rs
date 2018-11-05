@@ -140,6 +140,7 @@ extern crate parquet_format;
 extern crate snap;
 extern crate thrift;
 extern crate zstd;
+extern crate arrow;
 
 #[cfg(test)]
 extern crate rand;
@@ -161,3 +162,4 @@ mod encodings;
 pub mod file;
 pub mod record;
 pub mod schema;
+pub mod arrow_format;
