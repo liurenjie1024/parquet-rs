@@ -32,16 +32,17 @@ use basic::LogicalType;
 use basic::Type as PhysicalType;
 use basic::Repetition;
 
-use arrow::datatypes::Schema;
-use arrow::datatypes::Field;
-use arrow::datatypes::DataType;
+use arrow_lib::datatypes::Schema;
+use arrow_lib::datatypes::Field;
+use arrow_lib::datatypes::DataType;
 
-use errors::ParquetError;
+use errors::ParquetError::ArrowError;
 use errors::Result;
 
 /// Convert parquet schema to arrow schema.
 pub fn parquet_to_arrow_schema(parquet_schema: SchemaDescPtr) -> Result<Schema> {
-  parquet_to_arrow_schema_by_columns(parquet_schema.clone(), 0..parquet_schema.columns().len())
+  parquet_to_arrow_schema_by_columns(parquet_schema.clone(),
+                                     0..parquet_schema.columns().len())
 }
 
 /// Convert parquet schema to arrow schema, only preserving some leaf columns.
@@ -55,7 +56,7 @@ pub fn parquet_to_arrow_schema_by_columns<T>(
   for c in column_indices {
     let column = parquet_schema.column(c).self_type() as *const Type;
     let root = parquet_schema.get_column_root_ptr(c);
-    let root_raw_ptr = Rc::into_raw(root.clone());
+    let root_raw_ptr = root.clone().as_ref() as *const Type;
     
     leaves.insert(column);
     if !base_nodes_set.contains(&root_raw_ptr) {
@@ -74,8 +75,8 @@ pub fn parquet_to_arrow_schema_by_columns<T>(
     .map(|fields| Schema::new(fields))
 }
 
-/// This struct is used to group methods and data structures used to convert parquet schema
-/// together.
+/// This struct is used to group methods and data structures used to convert parquet
+/// schema together.
 struct ParquetTypeConverter {
   schema: TypePtr,
   leaves: Rc<HashSet<*const Type>>
@@ -101,7 +102,7 @@ impl ParquetTypeConverter {
   // Interfaces.
   
   fn to_data_type(&self) -> Result<Option<DataType>> {
-    match &*self.schema {
+    match self.schema.as_ref() {
       Type::PrimitiveType {..} => self.to_primitive_type(),
       Type::GroupType {..} => self.to_group_type()
     }
@@ -135,7 +136,7 @@ impl ParquetTypeConverter {
   }
   
   fn is_self_included(&self) -> bool {
-    self.leaves.contains(&Rc::into_raw(self.schema.clone()))
+    self.leaves.contains(&(self.schema.as_ref() as *const Type))
   }
   
   
@@ -174,7 +175,7 @@ impl ParquetTypeConverter {
       PhysicalType::FLOAT => Ok(DataType::Float32),
       PhysicalType::DOUBLE => Ok(DataType::Float64),
       PhysicalType::BYTE_ARRAY => self.to_byte_array(),
-      other => Err(ParquetError::ArrowError(format!("Unable to convert parquet type {}", other)))
+      other => Err(ArrowError(format!("Unable to convert parquet type {}", other)))
     }
   }
   
@@ -187,7 +188,8 @@ impl ParquetTypeConverter {
       LogicalType::INT_8 => Ok(DataType::Int8),
       LogicalType::INT_16 => Ok(DataType::Int16),
       LogicalType::INT_32 => Ok(DataType::Int32),
-      other => Err(ParquetError::ArrowError(format!("Unable to convert parquet logical type {}", other)))
+      other => Err(ArrowError(
+        format!("Unable to convert parquet logical type {}", other)))
     }
   }
   
@@ -196,21 +198,23 @@ impl ParquetTypeConverter {
       LogicalType::NONE => Ok(DataType::Int64),
       LogicalType::INT_64 => Ok(DataType::Int64),
       LogicalType::UINT_64 => Ok(DataType::UInt64),
-      other => Err(ParquetError::ArrowError(format!("Unable to convert parquet logical type {}", other)))
+      other => Err(ArrowError(
+        format!("Unable to convert parquet logical type {}", other)))
     }
   }
   
   fn to_byte_array(&self) -> Result<DataType> {
     match self.schema.get_basic_info().logical_type() {
       LogicalType::UTF8 => Ok(DataType::Utf8),
-      other => Err(ParquetError::ArrowError(format!("Unable to convert parquet logical type {}", other)))
+      other => Err(ArrowError(
+        format!("Unable to convert parquet logical type {}", other)))
     }
   }
   
   // Functions for group types.
   
   fn to_struct(&self) -> Result<Option<DataType>> {
-    match &*self.schema {
+    match self.schema.as_ref() {
       Type::PrimitiveType {..} => panic!("This should not happen."),
       Type::GroupType {
         basic_info: _,
@@ -234,7 +238,7 @@ impl ParquetTypeConverter {
   }
   
   fn to_list(&self) -> Result<Option<DataType>> {
-    match &*self.schema {
+    match self.schema.as_ref() {
       Type::PrimitiveType {..} => panic!("This should not happen."),
       Type::GroupType {
         basic_info: _,
@@ -243,47 +247,43 @@ impl ParquetTypeConverter {
         let list_item = fields.first().unwrap();
         let item_converter = self.clone_with_schema(list_item.clone());
         
-        let item_type = match &**list_item {
+        let item_type = match list_item.as_ref() {
           Type::PrimitiveType {
             ..
           }  => {
             if item_converter.is_repeated() {
               item_converter.to_primitive_type_inner().map(|dt| Some(dt))
             } else {
-              Err(ParquetError::ArrowError("Unrecognized list type.".to_string()))
+              Err(ArrowError(
+                "Primitive element type of list must be repeated.".to_string()))
             }
           },
           Type::GroupType {
             basic_info: _,
             fields
-          } if fields.len()>1 => {
-            item_converter.to_struct()
-          },
-          Type::GroupType {
-            basic_info: _,
-            fields
-          } if fields.len()==1 && list_item.name()!="array" &&
-            list_item.name()!=format!("{}_tuple", self.schema.name()) => {
-            let nested_item = fields.first().unwrap();
-            let nested_item_converter = self.clone_with_schema(nested_item.clone());
-            
-            nested_item_converter.to_data_type()
-          },
-          Type::GroupType {
-            basic_info: _,
-            fields: _
-          } => {
-            item_converter.to_struct()
+          }  => {
+            if fields.len() > 1 {
+              item_converter.to_struct()
+            } else if fields.len() == 1 && list_item.name() != "array"
+              && list_item.name() != format!("{}_tuple", self.schema.name()) {
+
+              let nested_item = fields.first().unwrap();
+              let nested_item_converter = self.clone_with_schema(nested_item.clone());
+
+              nested_item_converter.to_data_type()
+            } else {
+              item_converter.to_struct()
+            }
           }
         };
         
         item_type.map(|opt| opt.map(|dt| DataType::List(Box::new(dt))))
       },
-      _ => Err(ParquetError::ArrowError("Unrecognized list type.".to_string()))
+      _ => Err(ArrowError(
+        "Group element type of list can only contain one field.".to_string()))
     }
   }
 }
-
 
 
 
@@ -298,8 +298,8 @@ mod tests {
   use basic::Repetition;
   use schema::types::PrimitiveTypeBuilder;
   
-  use arrow::datatypes::Field;
-  use arrow::datatypes::DataType;
+  use arrow_lib::datatypes::Field;
+  use arrow_lib::datatypes::DataType;
 
   use super::parquet_to_arrow_schema;
   use super::parquet_to_arrow_schema_by_columns;
@@ -319,15 +319,20 @@ mod tests {
   #[test]
   fn test_flat_primitives() {
     let mut parquet_types = vec![
-      make_parquet_type!("boolean", PhysicalType::BOOLEAN, with_repetition: Repetition::REQUIRED),
-      make_parquet_type!("int8", PhysicalType::INT32, with_repetition: Repetition::REQUIRED,
-        with_logical_type: LogicalType::INT_8),
-      make_parquet_type!("int16", PhysicalType::INT32, with_repetition: Repetition::REQUIRED,
-        with_logical_type: LogicalType::INT_16),
-      make_parquet_type!("int32", PhysicalType::INT32, with_repetition: Repetition::REQUIRED),
-      make_parquet_type!("int64", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
-      make_parquet_type!("double", PhysicalType::DOUBLE, with_repetition: Repetition::OPTIONAL),
-      make_parquet_type!("float", PhysicalType::FLOAT, with_repetition: Repetition::OPTIONAL),
+      make_parquet_type!("boolean", PhysicalType::BOOLEAN,
+        with_repetition: Repetition::REQUIRED),
+      make_parquet_type!("int8", PhysicalType::INT32,
+        with_repetition: Repetition::REQUIRED, with_logical_type: LogicalType::INT_8),
+      make_parquet_type!("int16", PhysicalType::INT32,
+        with_repetition: Repetition::REQUIRED, with_logical_type: LogicalType::INT_16),
+      make_parquet_type!("int32", PhysicalType::INT32,
+        with_repetition: Repetition::REQUIRED),
+      make_parquet_type!("int64", PhysicalType::INT64,
+        with_repetition: Repetition::REQUIRED),
+      make_parquet_type!("double", PhysicalType::DOUBLE,
+        with_repetition: Repetition::OPTIONAL),
+      make_parquet_type!("float", PhysicalType::FLOAT,
+        with_repetition: Repetition::OPTIONAL),
       make_parquet_type!("string", PhysicalType::BYTE_ARRAY,
         with_repetition: Repetition::OPTIONAL, with_logical_type: LogicalType::UTF8),
     ];
@@ -338,7 +343,8 @@ mod tests {
       .unwrap();
     
     let parquet_schema = SchemaDescriptor::new(Rc::new(parquet_group_type));
-    let converted_arrow_schema = parquet_to_arrow_schema(Rc::new(parquet_schema)).unwrap();
+    let converted_arrow_schema = parquet_to_arrow_schema(Rc::new(parquet_schema))
+      .unwrap();
     
     let arrow_fields = vec![
       Field::new("boolean", DataType::Boolean, false),
@@ -357,9 +363,10 @@ mod tests {
   #[test]
   fn test_duplicate_fields() {
     let mut parquet_types = vec![
-      make_parquet_type!("boolean", PhysicalType::BOOLEAN, with_repetition: Repetition::REQUIRED),
-      make_parquet_type!("int8", PhysicalType::INT32, with_repetition: Repetition::REQUIRED,
-        with_logical_type: LogicalType::INT_8)
+      make_parquet_type!("boolean", PhysicalType::BOOLEAN,
+        with_repetition: Repetition::REQUIRED),
+      make_parquet_type!("int8", PhysicalType::INT32,
+        with_repetition: Repetition::REQUIRED, with_logical_type: LogicalType::INT_8)
     ];
     
     let parquet_group_type = GroupTypeBuilder::new("")
@@ -418,7 +425,8 @@ mod tests {
       
       parquet_types.push(Rc::new(my_list));
 
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), false));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), false));
     }
   
     // // List<String> (list nullable, elements non-null)
@@ -449,7 +457,8 @@ mod tests {
   
       parquet_types.push(Rc::new(my_list));
 
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
     }
   
     // Element types can be nested structures. For example, a list of lists:
@@ -499,7 +508,8 @@ mod tests {
       parquet_types.push(Rc::new(array_of_arrays));
 
       let arrow_inner_list = DataType::List(Box::new(DataType::Int32));
-      arrow_fields.push(Field::new("array_of_arrays", DataType::List(Box::new(arrow_inner_list)), true));
+      arrow_fields.push(
+        Field::new("array_of_arrays", DataType::List(Box::new(arrow_inner_list)), true));
     }
 
 
@@ -530,7 +540,8 @@ mod tests {
         .unwrap();
 
       parquet_types.push(Rc::new(my_list));
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(DataType::Utf8)), true));
     }
 
     // // List<Integer> (nullable list, non-null elements)
@@ -552,7 +563,8 @@ mod tests {
 
       parquet_types.push(Rc::new(my_list));
 
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(DataType::Int32)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(DataType::Int32)), true));
     }
 
     // // List<Tuple<String, Integer>> (nullable list, non-null elements)
@@ -564,9 +576,10 @@ mod tests {
     // }
     {
       let mut primitives = vec![
-        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
-         with_repetition: Repetition::REQUIRED),
-        make_parquet_type!("num", PhysicalType::INT32, with_repetition: Repetition::REQUIRED)
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY,
+          with_logical_type: LogicalType::UTF8, with_repetition: Repetition::REQUIRED),
+        make_parquet_type!("num", PhysicalType::INT32,
+          with_repetition: Repetition::REQUIRED)
       ];
 
       let element = GroupTypeBuilder::new("element")
@@ -588,7 +601,8 @@ mod tests {
         Field::new("str", DataType::Utf8, false),
         Field::new("num", DataType::Int32, false),
       ]);
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
     }
 
     // // List<OneTuple<String>> (nullable list, non-null elements)
@@ -600,8 +614,8 @@ mod tests {
     // Special case: group is named array
     {
       let mut primitives = vec![
-        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
-          with_repetition: Repetition::REQUIRED)
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY,
+        with_logical_type: LogicalType::UTF8, with_repetition: Repetition::REQUIRED)
       ];
 
       let array = GroupTypeBuilder::new("array")
@@ -622,7 +636,8 @@ mod tests {
       let arrow_struct = DataType::Struct(vec![
         Field::new("str", DataType::Utf8, false)
       ]);
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
     }
 
     // // List<OneTuple<String>> (nullable list, non-null elements)
@@ -634,8 +649,8 @@ mod tests {
     // Special case: group named ends in _tuple
     {
       let mut primitives = vec![
-        make_parquet_type!("str", PhysicalType::BYTE_ARRAY, with_logical_type: LogicalType::UTF8,
-          with_repetition: Repetition::REQUIRED)
+        make_parquet_type!("str", PhysicalType::BYTE_ARRAY,
+        with_logical_type: LogicalType::UTF8, with_repetition: Repetition::REQUIRED)
       ];
 
       let array = GroupTypeBuilder::new("my_list_tuple")
@@ -656,7 +671,8 @@ mod tests {
       let arrow_struct = DataType::Struct(vec![
         Field::new("str", DataType::Utf8, false)
       ]);
-      arrow_fields.push(Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
+      arrow_fields.push(
+        Field::new("my_list", DataType::List(Box::new(arrow_struct)), true));
     }
 
     // One-level encoding: Only allows required lists with required cells
@@ -664,7 +680,8 @@ mod tests {
     {
       parquet_types.push(make_parquet_type!("name", PhysicalType::INT32,
         with_repetition: Repetition::REPEATED));
-      arrow_fields.push(Field::new("name", DataType::List(Box::new(DataType::Int32)), true));
+      arrow_fields.push(
+        Field::new("name", DataType::List(Box::new(DataType::Int32)), true));
     }
   
   
@@ -697,8 +714,10 @@ mod tests {
       let group1 = GroupTypeBuilder::new("group1")
         .with_repetition(Repetition::REQUIRED)
         .with_fields(&mut vec![
-          make_parquet_type!("leaf1", PhysicalType::BOOLEAN, with_repetition: Repetition::REQUIRED),
-          make_parquet_type!("leaf2", PhysicalType::INT32, with_repetition: Repetition::REQUIRED)
+          make_parquet_type!("leaf1", PhysicalType::BOOLEAN,
+            with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT32,
+            with_repetition: Repetition::REQUIRED)
         ]).build()
         .unwrap();
       parquet_types.push(Rc::new(group1));
@@ -762,8 +781,10 @@ mod tests {
       let group1 = GroupTypeBuilder::new("group1")
         .with_repetition(Repetition::REQUIRED)
         .with_fields(&mut vec![
-          make_parquet_type!("leaf1", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
-          make_parquet_type!("leaf2", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf1", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
         ]).build()
         .unwrap();
       parquet_types.push(Rc::new(group1));
@@ -771,8 +792,10 @@ mod tests {
       let group2 = GroupTypeBuilder::new("group2")
         .with_repetition(Repetition::REQUIRED)
         .with_fields(&mut vec![
-          make_parquet_type!("leaf3", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
-          make_parquet_type!("leaf4", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf3", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf4", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
         ]).build()
         .unwrap();
       parquet_types.push(Rc::new(group2));
@@ -804,8 +827,8 @@ mod tests {
       .unwrap();
 
     let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
-    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(parquet_schema.clone(),
-      vec![0, 3, 4]).unwrap();
+    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(
+      parquet_schema.clone(), vec![0, 3, 4]).unwrap();
     let converted_fields = converted_arrow_schema.fields();
 
     assert_eq!(arrow_fields.len(), converted_fields.len());
@@ -842,8 +865,10 @@ mod tests {
       let group1 = GroupTypeBuilder::new("group1")
         .with_repetition(Repetition::REQUIRED)
         .with_fields(&mut vec![
-          make_parquet_type!("leaf1", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
-          make_parquet_type!("leaf2", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf1", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf2", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
         ]).build()
         .unwrap();
       parquet_types.push(Rc::new(group1));
@@ -851,8 +876,10 @@ mod tests {
       let group2 = GroupTypeBuilder::new("group2")
         .with_repetition(Repetition::REQUIRED)
         .with_fields(&mut vec![
-          make_parquet_type!("leaf3", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
-          make_parquet_type!("leaf4", PhysicalType::INT64, with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf3", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
+          make_parquet_type!("leaf4", PhysicalType::INT64,
+            with_repetition: Repetition::REQUIRED),
         ]).build()
         .unwrap();
       parquet_types.push(Rc::new(group2));
@@ -884,8 +911,8 @@ mod tests {
       .unwrap();
 
     let parquet_schema = Rc::new(SchemaDescriptor::new(Rc::new(parquet_group_type)));
-    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(parquet_schema.clone(),
-                                                                    vec![3, 4, 0]).unwrap();
+    let converted_arrow_schema = parquet_to_arrow_schema_by_columns(
+      parquet_schema.clone(), vec![3, 4, 0]).unwrap();
     let converted_fields = converted_arrow_schema.fields();
 
     assert_eq!(arrow_fields.len(), converted_fields.len());
