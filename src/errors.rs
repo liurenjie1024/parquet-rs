@@ -49,6 +49,7 @@ quick_error! {
       display("EOF: {}", message)
       description(message)
     }
+
     /// Arrow error.
     /// Returned when reading into arrow or writing from arrow.
     ArrowError(message:  String) {
