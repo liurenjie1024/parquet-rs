@@ -130,6 +130,7 @@
 #[macro_use]
 extern crate quick_error;
 extern crate arena;
+extern crate arrow as arrow_lib;
 extern crate brotli;
 extern crate byteorder;
 extern crate chrono;
@@ -140,7 +141,6 @@ extern crate parquet_format;
 extern crate snap;
 extern crate thrift;
 extern crate zstd;
-extern crate arrow as arrow_lib;
 
 #[cfg(test)]
 extern crate rand;
@@ -156,10 +156,10 @@ pub use util::memory;
 
 #[macro_use]
 mod util;
+pub mod arrow;
 pub mod column;
 pub mod compression;
 mod encodings;
 pub mod file;
 pub mod record;
 pub mod schema;
-pub mod arrow;

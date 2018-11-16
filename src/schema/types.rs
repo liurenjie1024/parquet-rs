@@ -732,7 +732,11 @@ impl SchemaDescriptor {
     );
 
     let result = self.leaf_to_base.get(&i);
-    assert!(result.is_some(), "Expected a value for index {} but found None", i);
+    assert!(
+      result.is_some(),
+      "Expected a value for index {} but found None",
+      i
+    );
     result.unwrap()
   }
 

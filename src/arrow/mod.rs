@@ -22,7 +22,4 @@
 
 pub mod schema;
 
-pub use self::schema::parquet_to_arrow_schema;
-pub use self::schema::parquet_to_arrow_schema_by_columns;
-
-
+pub use self::schema::{parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns};
